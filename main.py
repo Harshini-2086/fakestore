@@ -79,7 +79,10 @@ def get_cart_recommendations():
     #  INITIALIZE THE CLIENT HERE INSIDE THE ROUTE
     try:
         # This will now successfully grab the GEMINI_API_KEY set in your Cloud Run Console
-        client = genai.Client() 
+        api_key = os.environ.get("GEMINI_API_KEY")
+        
+        # Pass it directly to the client constructor
+        client = genai.Client(api_key=api_key)
     except Exception as e:
         raise HTTPException(
             status_code=500, 

@@ -3,3 +3,5 @@ uvicorn
 requests
 pydantic
 email-validator
+google-genai
+python-dotenv

@@ -10,9 +10,6 @@ load_dotenv()
 
 app = FastAPI(title="Fake Store API Wrapper")
 
-# Initialize Gemini Client
-client = genai.Client()
-
 class Category(BaseModel):
     id: int
     name: str
@@ -63,7 +60,8 @@ def view_cart():
         "cart_items": shopping_cart
     }
 
-#NEW ENDPOINT: AI Assistant using your existing store structure
+
+
 @app.get("/cart/ai-recommendation")
 def get_cart_recommendations():
     """
@@ -72,6 +70,16 @@ def get_cart_recommendations():
     """
     if not shopping_cart:
         return {"recommendation": "Your cart is empty! Add products first to get AI recommendations."}
+
+    #  INITIALIZE THE CLIENT HERE INSIDE THE ROUTE
+    try:
+        # This will now successfully grab the GEMINI_API_KEY set in your Cloud Run Console
+        client = genai.Client() 
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail="GenAI Client failed to initialize. Check Cloud Run Environment Variables."
+        )
 
     # Fetch store catalog
     response = requests.get(STORE_URL)
@@ -91,7 +99,7 @@ def get_cart_recommendations():
     available_catalog = [
         {"id": p["id"], "title": p["title"], "category": p["category"]["name"], "price": p["price"]}
         for p in all_products if p["id"] not in cart_ids
-    ][:15] # Limit data to 15 items to maintain speed and minimize prompt size
+    ][:15] 
 
     prompt = f"""
     You are an e-commerce assistant. Review the customer's current shopping cart:

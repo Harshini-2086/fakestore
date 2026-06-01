@@ -2,11 +2,16 @@ import os
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
-from dotenv import load_dotenv
-from google import genai
+from pydantic_settings import BaseSettings
 
-# Load local .env variables (used for local machine development only)
-load_dotenv()
+# This automatically lods your local .env file when running on your machine,
+# but ignores it safely without crashing when deploying on Cloud Run!
+class Settings(BaseSettings):
+    class Config:
+        env_file = ".env"
+        extra = "ignore"
+
+settings = Settings()
 
 app = FastAPI(title="Fake Store API Wrapper")
 

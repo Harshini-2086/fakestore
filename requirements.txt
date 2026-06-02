@@ -7,3 +7,5 @@ email-validator
 google-genai
 numpy
 python-multipart
+firebase-admin
+gunicorn

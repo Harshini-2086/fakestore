@@ -189,7 +189,7 @@ def smart_search(query: str):
     
     # 3. Batch generate text embeddings for entire store catalog
     catalog_embed_resp = client.models.embed_content(
-        model="text-embedding-004",
+        model="gemini-embedding-2",
         contents=product_texts
     )
     

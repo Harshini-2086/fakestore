@@ -84,7 +84,7 @@ def get_gemini_client():
 
 def fetch_catalog():
     #Fetches the external inventory list directly with failure handling
-    response = requests.get(STORE_URL)
+    response = requests.get("https://api.escuelajs.co/api/v1/products")
     if response.status_code != 200:
         raise HTTPException(status_code=500, detail="Failed to fetch store catalog.")
     return response.json()

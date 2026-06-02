@@ -8,6 +8,8 @@ from google.genai import types
 from fastapi import FastAPI, HTTPException, status, UploadFile, File
 from pydantic import BaseModel, HttpUrl
 from pydantic_settings import BaseSettings
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 #Environment Configurations
 class Settings(BaseSettings):
@@ -18,8 +20,11 @@ class Settings(BaseSettings):
 settings = Settings()
 app = FastAPI(title="Fake Store AI Platform Wrapper")
 
+if not firebase_admin._apps:
+    firebase_admin.initialize_app()
+db = firestore.client()
+
 STORE_URL = "https://escuelajs.co"
-shopping_cart = []
 
 #Standard Core Pydantic Models
 class Category(BaseModel):
@@ -75,9 +80,6 @@ def get_gemini_client():
             detail="GEMINI_API_KEY environment variable is missing."
         )
         
-    # Configure the client to retry up to 3 times automatically on 503 error codes
-    from google.genai.errors import APIError
-    
     client = genai.Client(
         api_key=apikey,
         http_options={"max_retries": 3}
@@ -85,7 +87,7 @@ def get_gemini_client():
     return client
 
 def fetch_catalog():
-    #Fetches the external inventory list directly with failure handling
+    # Fetches the external inventory list directly with failure handling
     response = requests.get(STORE_URL)
     if response.status_code != 200:
         raise HTTPException(status_code=500, detail="Failed to fetch store catalog.")
@@ -99,47 +101,127 @@ def read_root():
 def say_hello():
     return {"message": "Hello World"}
 
+
+# ==========================================
+# NEW INFRASTRUCTURE: DATABASE CACHE SYNC
+# ==========================================
+
+@app.post("/products/sync")
+def sync_products_to_cache():
+    """
+    OPTIMIZATION: Pulls the external catalog, generates text embeddings ONCE via Gemini,
+    and saves everything to Firestore. Run this once at startup or via a cron job.
+    """
+    client = get_gemini_client()
+    catalog = fetch_catalog()
+    
+    # Context strings to turn into embeddings
+    product_texts = [f"{p['title']}: {p['description']}" for p in catalog]
+    
+    # Batch generate text embeddings for entire store catalog
+    catalog_embed_resp = client.models.embed_content(
+        model="text-embedding-004",
+        contents=product_texts
+    )
+    
+    # Save to Firestore using a high-performance batch write
+    batch = db.batch()
+    for idx, p in enumerate(catalog):
+        prod_id = str(p["id"])
+        doc_ref = db.collection("products").document(prod_id)
+        
+        # Grab vector array values cleanly
+        embedding_values = catalog_embed_resp.embeddings[idx].values
+        
+        product_data = {
+            "product_details": p,
+            "embedding": embedding_values
+        }
+        batch.set(doc_ref, product_data)
+        
+    batch.commit()
+    return {"message": f"Successfully cached {len(catalog)} products and vector embeddings in Firestore!"}
+
+
 @app.get("/products")
 def list_products():
-    return fetch_catalog()
-
-@app.post("/cart/add")
-def add_to_cart(item: CartInput):
-    all_products = fetch_catalog()
-    valid_ids = [p["id"] for p in all_products]
+    """Reads inventory directly out of our Firestore cache."""
+    docs = db.collection("products").stream()
+    products = [doc.to_dict()["product_details"] for doc in docs]
     
-    if item.product_id not in valid_ids:
+    # Fallback to direct fetch if the cache hasn't been seeded yet
+    if not products:
+        return fetch_catalog()
+    return products
+
+
+# ==========================================
+# UPGRADED FEATURES: MULTI-USER STORAGE
+# ==========================================
+
+@app.post("/cart/{user_id}/add")
+def add_to_cart(user_id: str, item: CartInput):
+    """Adds or updates an item in a specific user's persistent database cart."""
+    # Validate product exists in our system
+    prod_ref = db.collection("products").document(str(item.product_id)).get()
+    if not prod_ref.exists:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, 
-            detail=f"Product with ID {item.product_id} does not exist."
+            detail=f"Product with ID {item.product_id} does not exist in the database cache. Run /products/sync first."
         )
     
-    cart_item = {"product_id": item.product_id, "quantity": item.quantity}
-    shopping_cart.append(cart_item)
-    return {"message": "Successfully added item to cart", "added_item": cart_item}
+    cart_ref = db.collection("carts").document(user_id)
+    cart_doc = cart_ref.get()
+    
+    if cart_doc.exists:
+        items = cart_doc.to_dict().get("items", [])
+        # Increment quantity if item is already in cart
+        for existing_item in items:
+            if existing_item["product_id"] == item.product_id:
+                existing_item["quantity"] += item.quantity
+                break
+        else:
+            items.append({"product_id": item.product_id, "quantity": item.quantity})
+    else:
+        items = [{"product_id": item.product_id, "quantity": item.quantity}]
+        
+    cart_ref.set({"items": items})
+    return {"message": f"Successfully updated cart for user: {user_id}", "cart_items": items}
 
-@app.get("/cart")
-def view_cart():
+
+@app.get("/cart/{user_id}")
+def view_cart(user_id: str):
+    """Retrieves the persistent cart details for a single isolated user."""
+    cart_ref = db.collection("carts").document(user_id).get()
+    if not cart_ref.exists:
+        return {"total_items_in_cart": 0, "cart_items": []}
+        
+    items = cart_ref.to_dict().get("items", [])
     return {
-        "total_items_in_cart": len(shopping_cart), 
-        "cart_items": shopping_cart
+        "total_items_in_cart": sum(item["quantity"] for item in items), 
+        "cart_items": items
     }
 
-# UPDATED FEATURE: AI Recommendations Endpoint
-@app.get("/cart/ai-recommendation")
-def get_cart_recommendations():
-    """
-    Reads items currently inside the shopping cart, looks at available inventory, 
-    and asks Gemini to write tailored recommendations.
-    """
-    if not shopping_cart:
+
+@app.get("/cart/{user_id}/ai-recommendation")
+def get_cart_recommendations(user_id: str):
+    """Reads isolated user cart from Firestore and builds smart tailored recommendations."""
+    cart_ref = db.collection("carts").document(user_id).get()
+    if not cart_ref.exists:
+        return {"recommendation": "Your cart is empty! Add products first to get AI recommendations."}
+
+    cart_items = cart_ref.to_dict().get("items", [])
+    if not cart_items:
         return {"recommendation": "Your cart is empty! Add products first to get AI recommendations."}
 
     client = get_gemini_client()
-    all_products = fetch_catalog()
-    # Isolate product IDs in cart
-    cart_ids = [item["product_id"] for item in shopping_cart]
-    # Map details cleanly to keep prompts light and save token overhead
+    
+    # Retrieve product directory from database cache
+    docs = db.collection("products").stream()
+    all_products = [doc.to_dict()["product_details"] for doc in docs]
+    
+    cart_ids = [item["product_id"] for item in cart_items]
+    
     current_cart_details = [
         {"title": p["title"], "category": p["category"]["name"], "price": p["price"]}
         for p in all_products if p["id"] in cart_ids
@@ -170,59 +252,58 @@ def get_cart_recommendations():
         raise HTTPException(status_code=500, detail=f"Gemini processing error: {str(e)}")
 
 
-# FEATURE 1: Smart Search using Vector Embeddings (Concept Match)
+# ==========================================
+# OPTIMIZED AI SMART SEARCH
+# ==========================================
+
 @app.get("/products/search/smart")
 def smart_search(query: str):
     """
-    Finds items conceptually matching a user query, even if keywords mismatch.
+    HIGH SPEED VECTORS: Compares incoming user query only against 
+    pre-calculated embeddings pulled directly from Firestore.
     """
     client = get_gemini_client()
-    catalog = fetch_catalog()
     
-    # 1. Generate text embedding for user's query
+    # 1. Generate text embedding ONLY for the single incoming search query
     query_embed_resp = client.models.embed_content(
         model="text-embedding-004",
         contents=query
     )
-    query_vector = np.array(query_embed_resp.embeddings.values)
+    # Note: query_embed_resp.embeddings is a list; we index [0] to extract values safely
+    query_vector = np.array(query_embed_resp.embeddings[0].values)
     
-    # 2. Build product context strings
-    product_texts = [f"{p['title']}: {p['description']}" for p in catalog]
+    # 2. Pull pre-cached vectors directly out of Firestore stream
+    products_ref = db.collection("products")
+    docs = products_ref.stream()
     
-    # 3. Batch generate text embeddings for entire store catalog
-    catalog_embed_resp = client.models.embed_content(
-        model="text-embedding-004",
-        contents=product_texts
-    )
-    
-    # 4. Rank results via Cosine Similarity score
     scored_products = []
-    for idx, emb in enumerate(catalog_embed_resp.embeddings):
-        prod_vector = np.array(emb.values)
-        similarity = np.dot(query_vector, prod_vector) / (np.linalg.norm(query_vector) * np.linalg.norm(prod_vector))
-        scored_products.append((similarity, catalog[idx]))
+    for doc in docs:
+        data = doc.to_dict()
+        prod_vector = np.array(data["embedding"])
+        product_details = data["product_details"]
         
-    # 5. Sort by highest score first and return top 5
+        # Calculate Cosine Similarity
+        similarity = np.dot(query_vector, prod_vector) / (np.linalg.norm(query_vector) * np.linalg.norm(prod_vector))
+        scored_products.append((similarity, product_details))
+        
+    # 3. Sort by highest matching score first and return top 5
     scored_products.sort(key=lambda x: x[0], reverse=True)
     return {"results": [item[1] for item in scored_products[:5]]}
 
 
-# FEATURE 2: Automated Product Categorization (Structured Outputs)
+# ==========================================
+# MULTIMODAL, TRANSLATION, AND ANALYTICS
+# ==========================================
+
 @app.post("/products/ai-classify")
 def classify_product(item: AutoCategoryInput):
-    """
-    Analyzes item titles and descriptions to correctly place them into segments.
-    """
     client = get_gemini_client()
-    
     prompt = f"""
     Analyze this item submission for an e-commerce marketplace:
     Title: {item.title}
     Description: {item.description}
-    
     Determine the single most accurate category name (e.g., Electronics, Clothes, Shoes, Furniture, Toys).
     """
-    
     try:
         completion = client.models.generate_content(
             model='gemini-2.5-flash',
@@ -236,28 +317,25 @@ def classify_product(item: AutoCategoryInput):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# FEATURE 3: Multimodal Visual Shopping Search (Image Upload)
 @app.post("/products/search/visual")
 async def visual_search(file: UploadFile = File(...)):
-    """
-    Accepts an uploaded image file and returns matching variants from our catalog list.
-    """
     client = get_gemini_client()
-    catalog = fetch_catalog()
     
-    # Prune catalog data size down to stay safely inside token boundaries
+    # Use cached products instead of external catalog to reduce latency
+    docs = db.collection("products").stream()
+    catalog = [doc.to_dict()["product_details"] for doc in docs]
+    if not catalog:
+        catalog = fetch_catalog()
+        
     light_catalog = [{"id": p["id"], "title": p["title"], "category": p["category"]["name"]} for p in catalog][:30]
     image_bytes = await file.read()
     
     prompt = f"""
     Analyze the uploaded item in this visual photo. Look over our catalog data:
     {light_catalog}
-    
     Find and return up to 3 Product IDs from the catalog list that look visually similar in color, shape, pattern, or utility.
     Return your answer strictly as a comma-separated list of IDs, nothing else. Example: 4, 12, 18
     """
-    
     try:
         completion = client.models.generate_content(
             model='gemini-2.5-flash',
@@ -266,8 +344,6 @@ async def visual_search(file: UploadFile = File(...)):
                 prompt
             ]
         )
-        
-        # Parse the raw comma list text out to recover full item matches
         id_strings = completion.text.strip().split(",")
         matched_ids = [int(i.strip()) for i in id_strings if i.strip().isdigit()]
         
@@ -276,13 +352,8 @@ async def visual_search(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# FEATURE 4: Localization & Persona Rewrites
 @app.post("/products/ai-translate")
 def translate_description(data: RewriteDescriptionInput):
-    """
-    Translates or re-tones descriptions for target regional audiences.
-    """
     client = get_gemini_client()
     prompt = f"""
     Rewrite this product description.
@@ -299,12 +370,8 @@ def translate_description(data: RewriteDescriptionInput):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# FEATURE 5: AI Review Summary & Sentiment Analytics
 @app.post("/products/reviews/analyze")
 def analyze_reviews(data: ReviewsInput):
-    """
-    Compiles long list blocks of community feedback text into dynamic summaries.
-    """
     client = get_gemini_client()
     prompt = f"""
     Read through these customer reviews left on our site product page:

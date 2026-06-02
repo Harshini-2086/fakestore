@@ -8,8 +8,8 @@ from google.genai import types
 from fastapi import FastAPI, HTTPException, status, UploadFile, File
 from pydantic import BaseModel, HttpUrl
 from pydantic_settings import BaseSettings
-import firebase_admin
-from firebase_admin import credentials, firestore
+#import firebase_admin
+#from firebase_admin import credentials, firestore
 
 #Environment Configurations
 class Settings(BaseSettings):
@@ -20,9 +20,9 @@ class Settings(BaseSettings):
 settings = Settings()
 app = FastAPI(title="Fake Store AI Platform Wrapper")
 
-if not firebase_admin._apps:
-    firebase_admin.initialize_app()
-db = firestore.client()
+#if not firebase_admin._apps:
+    #firebase_admin.initialize_app()
+#db = firestore.client()
 
 STORE_URL = "https://escuelajs.co"
 shopping_cart = []

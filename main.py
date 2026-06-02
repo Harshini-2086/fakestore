@@ -182,8 +182,7 @@ def smart_search(query: str):
         model="gemini-embedding-2",
         contents=query
     )
-    query_vector = np.array(query_embed_resp.embeddings.values)
-    
+    query_vector = np.array(query_embed_resp.embeddings[0].values) 
     # 2. Build product context strings
     product_texts = [f"{p['title']}: {p['description']}" for p in catalog]
     

@@ -5,3 +5,4 @@ pydantic
 pydantic-settings
 email-validator
 google-genai
+numpy

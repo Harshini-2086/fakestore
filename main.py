@@ -65,17 +65,24 @@ class ReviewSummarySchema(BaseModel):
     cons: list[str]
     verdict: str
 
-
 #Helper Functions
 def get_gemini_client():
-    #Initializes the official Google GenAI Client wrapper securely
+    """Initializes the official GenAI Client with built-in automatic retry handling."""
     apikey = os.environ.get("GEMINI_API_KEY")
     if not apikey:
         raise HTTPException(
             status_code=500, 
             detail="GEMINI_API_KEY environment variable is missing."
         )
-    return genai.Client(api_key=apikey)
+        
+    # Configure the client to retry up to 3 times automatically on 503 error codes
+    from google.genai.errors import APIError
+    
+    client = genai.Client(
+        api_key=apikey,
+        http_options={"max_retries": 3}
+    )
+    return client
 
 def fetch_catalog():
     #Fetches the external inventory list directly with failure handling

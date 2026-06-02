@@ -179,7 +179,7 @@ def smart_search(query: str):
     
     # 1. Generate text embedding for user's query
     query_embed_resp = client.models.embed_content(
-        model="text-embedding-004",
+        model="gemini-embedding-2",
         contents=query
     )
     query_vector = np.array(query_embed_resp.embeddings.values)

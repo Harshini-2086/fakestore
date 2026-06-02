@@ -258,7 +258,7 @@ async def visual_search(file: UploadFile = File(...)):
     
     try:
         completion = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-1.5-flash',
             contents=[
                 types.Part.from_bytes(data=image_bytes, mime_type=file.content_type),
                 prompt

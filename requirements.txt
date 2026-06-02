@@ -6,3 +6,4 @@ pydantic-settings
 email-validator
 google-genai
 numpy
+python-multipart

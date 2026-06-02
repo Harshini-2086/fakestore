@@ -169,7 +169,7 @@ def get_cart_recommendations():
 
 
 # FEATURE 1: Smart Search using Vector Embeddings (Concept Match)
-@app.get("/products/search/smart")
+'''@app.get("/products/search/smart")
 def smart_search(query: str):
     """
     Finds items conceptually matching a user query, even if keywords mismatch.
@@ -201,7 +201,7 @@ def smart_search(query: str):
         
     # 5. Sort by highest score first and return top 5
     scored_products.sort(key=lambda x: x[0], reverse=True)
-    return {"results": [item[1] for item in scored_products[:5]]}
+    return {"results": [item[1] for item in scored_products[:5]]}'''
 
 
 # FEATURE 2: Automated Product Categorization (Structured Outputs)

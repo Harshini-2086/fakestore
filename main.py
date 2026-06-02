@@ -1,4 +1,5 @@
 import os
+from urllib import response
 from google import genai
 import requests
 from fastapi import FastAPI, HTTPException
@@ -53,10 +54,32 @@ def list_products():
     else:
         raise HTTPException(status_code=400, detail="Failed to fetch products from Fake Store")
 
+from fastapi import HTTPException, status
+
 @app.post("/cart/add")
 def add_to_cart(item: CartInput):
+    #getting the product catalog to validate the entered product_id
+    response = requests.get(STORE_URL)
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=500, 
+            detail="Failed to fetch products from store catalog for validation."
+        )
+    all_products = response.json()
+    # 1. Extract all valid product IDs from your catalog
+    valid_ids = [p["id"] for p in all_products]
+    
+    # 2. Check if the user's product_id exists in that list
+    if item.product_id not in valid_ids:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Product with ID {item.product_id} does not exist."
+        )
+        
+    # 3. If valid, add the single item sent by the HTTP request
     cart_item = {"product_id": item.product_id, "quantity": item.quantity}
     shopping_cart.append(cart_item)
+    
     return {"message": "Successfully added item to cart", "added_item": cart_item}
 
 @app.get("/cart")
@@ -77,13 +100,10 @@ def get_cart_recommendations():
     if not shopping_cart:
         return {"recommendation": "Your cart is empty! Add products first to get AI recommendations."}
 
-    #  INITIALIZE THE CLIENT HERE INSIDE THE ROUTE
     try:
-        # This will now successfully grab the GEMINI_API_KEY set in your Cloud Run Console
+        # using os.environ.get to get the gemini API key from the enviornment
         apikey = os.environ.get("GEMINI_API_KEY")
-        
-        # Pass it directly to the client constructor
-        client = genai.Client(api_key=apikey)
+        client = genai.Client(api_key=apikey) #passing it directly to the constructor of the genai client
     except Exception as e:
         raise HTTPException(
             status_code=500, 
@@ -96,7 +116,7 @@ def get_cart_recommendations():
         raise HTTPException(status_code=500, detail="Failed to load items for AI parsing.")
     all_products = response.json()
 
-    # Isolate product IDs in cart
+    #Isolate product IDs in cart
     cart_ids = [item["product_id"] for item in shopping_cart]
 
     # Map details cleanly to keep prompts light and save token overhead

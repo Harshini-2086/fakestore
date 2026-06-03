@@ -66,7 +66,7 @@ class CategorizationSchema(BaseModel):
     reasoning: str
 
 class ReviewSummarySchema(BaseModel):
-    overall_sentiment: str  # e.g., Positive, Mixed, Negative
+    overall_sentiment: str  
     pros: list[str]
     cons: list[str]
     verdict: str
@@ -169,7 +169,7 @@ def get_cart_recommendations():
 
 
 # FEATURE 1: Smart Search using Vector Embeddings (Concept Match)
-'''@app.get("/products/search/smart")
+@app.get("/products/search/smart")
 def smart_search(query: str):
     """
     Finds items conceptually matching a user query, even if keywords mismatch.
@@ -179,7 +179,7 @@ def smart_search(query: str):
     
     # 1. Generate text embedding for user's query
     query_embed_resp = client.models.embed_content(
-        model="gemini-embedding-2",
+        model="gemini-embedding-001",
         contents=query
     )
     query_vector = np.array(query_embed_resp.embeddings[0].values) 
@@ -188,7 +188,7 @@ def smart_search(query: str):
     
     # 3. Batch generate text embeddings for entire store catalog
     catalog_embed_resp = client.models.embed_content(
-        model="gemini-embedding-2",
+        model="gemini-embedding-001",
         contents=product_texts
     )
     
@@ -201,7 +201,7 @@ def smart_search(query: str):
         
     # 5. Sort by highest score first and return top 5
     scored_products.sort(key=lambda x: x[0], reverse=True)
-    return {"results": [item[1] for item in scored_products[:5]]}'''
+    return {"results": [item[1] for item in scored_products[:5]]}
 
 
 # FEATURE 2: Automated Product Categorization (Structured Outputs)

@@ -215,7 +215,7 @@ def smart_search(query: str):
         scored_products.append((similarity, catalog[idx]))
         
     scored_products.sort(key=lambda x: x[0], reverse=True)
-    return {"results": [item[1] for item in scored_products[:5]]}
+    return {"results": [item[1] for item in scored_products[:150]]}
 
 
 # FEATURE 3: Cart Context Localization & Translation

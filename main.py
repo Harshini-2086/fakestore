@@ -60,6 +60,18 @@ class ReviewSummarySchema(BaseModel):
     cons: list[str]
     verdict: str
 
+# Represents recommendations for a single specific item in the cart
+class ItemRecommendation(BaseModel):
+    cart_product_id: int
+    cart_product_title: str
+    recommended_product_ids: list[int]
+    pitch_to_user: str
+
+# The final structure the AI pipeline will return
+class MultiCartAnalysisSchema(BaseModel):
+    recommendations_by_item: list[ItemRecommendation]
+    global_reasoning: str
+
 # Helper Functions
 def get_gemini_client():
     """Initializes the official GenAI Client with built-in automatic retry handling."""
@@ -112,10 +124,6 @@ def view_cart():
 # FEATURE 1: Combined Cart Analysis, Categorization & Inventory Matching
 @app.get("/cart/ai-analyze-and-match")
 def analyze_cart_and_match_inventory():
-    """
-    Analyzes items currently in the cart to classify the shopper's active target category, 
-    and cross-references the store catalog to suggest structurally valid similar items.
-    """
     if not shopping_cart:
         raise HTTPException(
             status_code=400, 
@@ -125,28 +133,26 @@ def analyze_cart_and_match_inventory():
     client = get_gemini_client()
     all_products = fetch_catalog()
     
-    # Extract structural references of items in cart
     cart_ids = [item["product_id"] for item in shopping_cart]
     items_in_cart = [p for p in all_products if p["id"] in cart_ids]
     
-    # Prune catalog context down to keep tokens lightweight
     available_catalog = [
         {"id": p["id"], "title": p["title"], "category": p["category"]["name"], "description": p["description"]}
         for p in all_products if p["id"] not in cart_ids
     ][:30]
 
+    #Forces item-by-item analysis
     prompt = f"""
-    You are an AI e-commerce categorization and recommendation system. 
+    You are an advanced e-commerce cross-selling and recommendation system.
     
-    Step 1: Analyze the current items in the user's cart:
+    The user has multiple items in their shopping cart:
     {json.dumps(items_in_cart)}
-    Determine the primary underlying category (e.g., Electronics, Clothes, Shoes, Furniture) that unites these items.
     
-    Step 2: Look over this store inventory chunk:
+    Look over our available store inventory:
     {json.dumps(available_catalog)}
-    Pick up to 3 Product IDs that align closely with the classified interests or complement the cart items.
     
-    Step 3: Draft a compelling 2-sentence user pitch explaining why they'll love those products.
+    For EACH individual item currently in the user's cart, look through the available store inventory and select 1 to 2 relevant, complementary, or similar products. 
+    Then, write a tailored 1-sentence pitch for that specific pairing.
     """
 
     try:
@@ -155,27 +161,34 @@ def analyze_cart_and_match_inventory():
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=CartAnalysisSchema
+                # Use our new itemized schema here
+                response_schema=MultiCartAnalysisSchema 
             )
         )
         
-        # Parse the structured JSON output from Gemini
         ai_response = json.loads(completion.text)
-        recommended_ids = ai_response.get("recommended_product_ids", [])
+        item_recommendations = ai_response.get("recommendations_by_item", [])
         
-        # Gather full structural product payloads from our actual catalog
-        matched_products = [p for p in all_products if p["id"] in recommended_ids]
-        
+        # Build a complete structured payload with full product objects from catalog
+        final_output = []
+        for rec in item_recommendations:
+            rec_ids = rec.get("recommended_product_ids", [])
+            matched_products = [p for p in all_products if p["id"] in rec_ids]
+            
+            final_output.append({
+                "cart_product_id": rec.get("cart_product_id"),
+                "cart_product_title": rec.get("cart_product_title"),
+                "pitch_to_user": rec.get("pitch_to_user"),
+                "similar_matched_products": matched_products
+            })
+            
         return {
-            "detected_category": ai_response.get("detected_core_category"),
-            "reasoning": ai_response.get("reasoning"),
-            "ai_pitch": ai_response.get("pitch_to_user"),
-            "similar_matched_products": matched_products
+            "global_reasoning": ai_response.get("global_reasoning"),
+            "recommendations": final_output
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI Matching pipeline failed: {str(e)}")
-
-
+    
 # FEATURE 2:Smart Search using Vector Embeddings
 @app.get("/products/search/smart")
 def smart_search(query: str):

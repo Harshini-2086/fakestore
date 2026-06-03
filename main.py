@@ -132,7 +132,6 @@ def get_cart_recommendations():
     """
     if not shopping_cart:
         return {"recommendation": "Your cart is empty! Add products first to get AI recommendations."}
-
     client = get_gemini_client()
     all_products = fetch_catalog()
     # Isolate product IDs in cart
@@ -142,11 +141,10 @@ def get_cart_recommendations():
         {"title": p["title"], "category": p["category"]["name"], "price": p["price"]}
         for p in all_products if p["id"] in cart_ids
     ]
-    
     available_catalog = [
         {"id": p["id"], "title": p["title"], "category": p["category"]["name"], "price": p["price"]}
         for p in all_products if p["id"] not in cart_ids
-    ][:15] 
+    ][:30] #only include first 30 items
 
     prompt = f"""
     You are an e-commerce assistant. Review the customer's current shopping cart:
@@ -176,7 +174,6 @@ def smart_search(query: str):
     """
     client = get_gemini_client()
     catalog = fetch_catalog()
-    
     # 1. Generate text embedding for user's query
     query_embed_resp = client.models.embed_content(
         model="gemini-embedding-001",
@@ -281,8 +278,16 @@ def translate_description(data: RewriteDescriptionInput):
     Translates or re-tones descriptions for target regional audiences.
     """
     client = get_gemini_client()
+    
+    # Strict instructions telling Gemini exactly how to behave
+    system_instruction = (
+        "You are a strict localization utility. Translate and adjust the tone of the provided text. "
+        "Return ONLY the final direct result. Do not include introductory text, meta-commentary, "
+        "explanations, multiple options, or conversational fluff. If the source text is short, vague, "
+        "or nonsensical, translate it literally without explaining yourself."
+    )
+    
     prompt = f"""
-    Rewrite this product description.
     Target Language: {data.target_language}
     Tone Preference: {data.tone}
     Original Description: {data.description}
@@ -290,9 +295,13 @@ def translate_description(data: RewriteDescriptionInput):
     try:
         completion = client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=prompt
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction, # <-- Keeps the response clean
+                temperature=0.2 # <-- Low temp stops it from getting "creative"
+            )
         )
-        return {"rewritten_text": completion.text}
+        return {"rewritten_text": completion.text.strip()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

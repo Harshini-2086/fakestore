@@ -1,5 +1,4 @@
 import os
-#import io
 import json
 import requests
 import numpy as np
@@ -8,10 +7,8 @@ from google.genai import types
 from fastapi import FastAPI, HTTPException, status, UploadFile, File
 from pydantic import BaseModel, HttpUrl
 from pydantic_settings import BaseSettings
-#import firebase_admin
-#from firebase_admin import credentials, firestore
 
-#Environment Configurations
+# Environment Configurations
 class Settings(BaseSettings):
     class Config:
         env_file = ".env"
@@ -20,14 +17,10 @@ class Settings(BaseSettings):
 settings = Settings()
 app = FastAPI(title="Fake Store AI Platform Wrapper")
 
-#if not firebase_admin._apps:
-    #firebase_admin.initialize_app()
-#db = firestore.client()
-
 STORE_URL = "https://escuelajs.co"
 shopping_cart = []
 
-#Standard Core Pydantic Models
+# Standard Core Pydantic Models
 class Category(BaseModel):
     id: int
     name: str
@@ -46,13 +39,8 @@ class CartInput(BaseModel):
     product_id: int
     quantity: int = 1
 
-# New Pydantic Models for AI Capabilities
-class AutoCategoryInput(BaseModel):
-    title: str
-    description: str
-
-class RewriteDescriptionInput(BaseModel):
-    description: str
+# Updated/New Pydantic Models for AI Capabilities
+class DynamicTranslateInput(BaseModel):
     target_language: str = "Hindi"
     tone: str = "Semi-Professional, friendly, and concise"
 
@@ -60,10 +48,11 @@ class ReviewsInput(BaseModel):
     reviews: list[str]
 
 # Structural Schemas for AI Responses
-class CategorizationSchema(BaseModel):
-    suggested_category_name: str
-    confidence_score: float
+class CartAnalysisSchema(BaseModel):
+    detected_core_category: str
     reasoning: str
+    recommended_product_ids: list[int]
+    pitch_to_user: str
 
 class ReviewSummarySchema(BaseModel):
     overall_sentiment: str  
@@ -71,7 +60,7 @@ class ReviewSummarySchema(BaseModel):
     cons: list[str]
     verdict: str
 
-#Helper Functions
+# Helper Functions
 def get_gemini_client():
     """Initializes the official GenAI Client with built-in automatic retry handling."""
     apikey = os.environ.get("GEMINI_API_KEY").strip()
@@ -83,7 +72,7 @@ def get_gemini_client():
     return genai.Client(api_key=apikey, vertexai=False)
 
 def fetch_catalog():
-    #Fetches the external inventory list directly with failure handling
+    """Fetches the external inventory list directly with failure handling."""
     response = requests.get("https://api.escuelajs.co/api/v1/products")
     if response.status_code != 200:
         raise HTTPException(status_code=500, detail="Failed to fetch store catalog.")
@@ -92,10 +81,6 @@ def fetch_catalog():
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the Fake Store AI API Wrapper! Go to /docs to test endpoints."}
-
-@app.get("/hello")
-def say_hello():
-    return {"message": "Hello World"}
 
 @app.get("/products")
 def list_products():
@@ -123,98 +108,138 @@ def view_cart():
         "cart_items": shopping_cart
     }
 
-# UPDATED FEATURE: AI Recommendations Endpoint
-@app.get("/cart/ai-recommendation")
-def get_cart_recommendations():
+
+# FEATURE 1: Combined Cart Analysis, Categorization & Inventory Matching
+@app.get("/cart/ai-analyze-and-match")
+def analyze_cart_and_match_inventory():
     """
-    Reads items currently inside the shopping cart, looks at available inventory, 
-    and asks Gemini to write tailored recommendations.
+    Analyzes items currently in the cart to classify the shopper's active target category, 
+    and cross-references the store catalog to suggest structurally valid similar items.
     """
     if not shopping_cart:
-        return {"recommendation": "Your cart is empty! Add products first to get AI recommendations."}
+        raise HTTPException(
+            status_code=400, 
+            detail="Your cart is empty! Add products first to run classification and matching."
+        )
+        
     client = get_gemini_client()
     all_products = fetch_catalog()
-    # Isolate product IDs in cart
+    
+    # Extract structural references of items in cart
     cart_ids = [item["product_id"] for item in shopping_cart]
-    # Map details cleanly to keep prompts light and save token overhead
-    current_cart_details = [
-        {"title": p["title"], "category": p["category"]["name"], "price": p["price"]}
-        for p in all_products if p["id"] in cart_ids
-    ]
+    items_in_cart = [p for p in all_products if p["id"] in cart_ids]
+    
+    # Prune catalog context down to keep tokens lightweight
     available_catalog = [
-        {"id": p["id"], "title": p["title"], "category": p["category"]["name"], "price": p["price"]}
+        {"id": p["id"], "title": p["title"], "category": p["category"]["name"], "description": p["description"]}
         for p in all_products if p["id"] not in cart_ids
-    ][:30] #only include first 30 items
+    ][:30]
 
     prompt = f"""
-    You are an e-commerce assistant. Review the customer's current shopping cart:
-    {current_cart_details}
-
-    Select the 2 best complementary items from this store catalog snippet:
-    {available_catalog}
-
-    Provide a short, welcoming, 2-sentence recommendation to the user explaining why they should add those items.
+    You are an AI e-commerce categorization and recommendation system. 
+    
+    Step 1: Analyze the current items in the user's cart:
+    {json.dumps(items_in_cart)}
+    Determine the primary underlying category (e.g., Electronics, Clothes, Shoes, Furniture) that unites these items.
+    
+    Step 2: Look over this store inventory chunk:
+    {json.dumps(available_catalog)}
+    Pick up to 3 Product IDs that align closely with the classified interests or complement the cart items.
+    
+    Step 3: Draft a compelling 2-sentence user pitch explaining why they'll love those products.
     """
 
     try:
         completion = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=CartAnalysisSchema
+            )
         )
-        return {"recommendation": completion.text}
+        
+        # Parse the structured JSON output from Gemini
+        ai_response = json.loads(completion.text)
+        recommended_ids = ai_response.get("recommended_product_ids", [])
+        
+        # Gather full structural product payloads from our actual catalog
+        matched_products = [p for p in all_products if p["id"] in recommended_ids]
+        
+        return {
+            "detected_category": ai_response.get("detected_core_category"),
+            "reasoning": ai_response.get("reasoning"),
+            "ai_pitch": ai_response.get("pitch_to_user"),
+            "similar_matched_products": matched_products
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini processing error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"AI Matching pipeline failed: {str(e)}")
 
 
-# FEATURE 1: Smart Search using Vector Embeddings (Concept Match)
+# FEATURE 2:Smart Search using Vector Embeddings
 @app.get("/products/search/smart")
 def smart_search(query: str):
-    """
-    Finds items conceptually matching a user query, even if keywords mismatch.
-    """
+    """Finds items conceptually matching a user query, even if keywords mismatch."""
     client = get_gemini_client()
     catalog = fetch_catalog()
-    # 1. Generate text embedding for user's query
+    
     query_embed_resp = client.models.embed_content(
         model="gemini-embedding-001",
         contents=query
     )
     query_vector = np.array(query_embed_resp.embeddings[0].values) 
-    # 2. Build product context strings
     product_texts = [f"{p['title']}: {p['description']}" for p in catalog]
     
-    # 3. Batch generate text embeddings for entire store catalog
     catalog_embed_resp = client.models.embed_content(
         model="gemini-embedding-001",
         contents=product_texts
     )
     
-    # 4. Rank results via Cosine Similarity score
     scored_products = []
     for idx, emb in enumerate(catalog_embed_resp.embeddings):
         prod_vector = np.array(emb.values)
         similarity = np.dot(query_vector, prod_vector) / (np.linalg.norm(query_vector) * np.linalg.norm(prod_vector))
         scored_products.append((similarity, catalog[idx]))
         
-    # 5. Sort by highest score first and return top 5
     scored_products.sort(key=lambda x: x[0], reverse=True)
     return {"results": [item[1] for item in scored_products[:5]]}
 
 
-# FEATURE 2: Automated Product Categorization (Structured Outputs)
-@app.post("/products/ai-classify")
-def classify_product(item: AutoCategoryInput):
+# FEATURE 3: Cart Context Localization & Translation
+@app.post("/cart/translate-descriptions")
+def translate_cart_descriptions(data: DynamicTranslateInput):
     """
-    Analyzes item titles and descriptions to correctly place them into segments.
+    Looks inside the active cart, extracts text configurations from items present, 
+    and passes them to Gemini for localization without asking the user for text.
     """
+    if not shopping_cart:
+        raise HTTPException(
+            status_code=400, 
+            detail="Shopping cart is empty. Nothing to translate."
+        )
+        
     client = get_gemini_client()
+    all_products = fetch_catalog()
+    
+    cart_ids = [item["product_id"] for item in shopping_cart]
+    items_to_translate = [
+        {"id": p["id"], "title": p["title"], "description": p["description"]}
+        for p in all_products if p["id"] in cart_ids
+    ]
+    
+    system_instruction = (
+        "You are a strict e-commerce localization utility. Translate the provided list of items "
+        "including their descriptions and titles into the targeted configuration. "
+        "Return ONLY valid minified JSON that mirrors the input structure with rewritten texts. "
+        "Do not wrap your output in markdown blocks or include pre/post conversational text strings."
+    )
     
     prompt = f"""
-    Analyze this item submission for an e-commerce marketplace:
-    Title: {item.title}
-    Description: {item.description}
+    Target Language: {data.target_language}
+    Tone Preference: {data.tone}
     
-    Determine the single most accurate category name (e.g., Electronics, Clothes, Shoes, Furniture, Toys).
+    Items Array to Transform:
+    {json.dumps(items_to_translate)}
     """
     
     try:
@@ -222,25 +247,23 @@ def classify_product(item: AutoCategoryInput):
             model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=CategorizationSchema
+                system_instruction=system_instruction,
+                temperature=0.3,
+                response_mime_type="application/json"
             )
         )
-        return json.loads(completion.text)
+        return {"translated_cart_items": json.loads(completion.text.strip())}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Localization engine failure: {str(e)}")
 
 
-# FEATURE 3: Multimodal Visual Shopping Search (Image Upload)
+# FEATURE 4: Multimodal Visual Shopping Search
 @app.post("/products/search/visual")
 async def visual_search(file: UploadFile = File(...)):
-    """
-    Accepts an uploaded image file and returns matching variants from our catalog list.
-    """
+    """Accepts an uploaded image file and returns matching variants from our catalog list."""
     client = get_gemini_client()
     catalog = fetch_catalog()
     
-    # Prune catalog data size down to stay safely inside token boundaries
     light_catalog = [{"id": p["id"], "title": p["title"], "category": p["category"]["name"]} for p in catalog][:30]
     image_bytes = await file.read()
     
@@ -254,14 +277,13 @@ async def visual_search(file: UploadFile = File(...)):
     
     try:
         completion = client.models.generate_content(
-            model='gemini-3.5-flash',
+            model='gemini-2.5-flash', # Updated to 2.5-flash as it is multimodal
             contents=[
                 types.Part.from_bytes(data=image_bytes, mime_type=file.content_type),
                 prompt
             ]
         )
         
-        # Parse the raw comma list text out to recover full item matches
         id_strings = completion.text.strip().split(",")
         matched_ids = [int(i.strip()) for i in id_strings if i.strip().isdigit()]
         
@@ -271,46 +293,10 @@ async def visual_search(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# FEATURE 4: Localization & Persona Rewrites
-@app.post("/products/ai-translate")
-def translate_description(data: RewriteDescriptionInput):
-    """
-    Translates or re-tones descriptions for target regional audiences.
-    """
-    client = get_gemini_client()
-    
-    # Strict instructions telling Gemini exactly how to behave
-    system_instruction = (
-        "You are a strict localization utility. Translate and adjust the tone of the provided text. "
-        "Return ONLY the final direct result. Do not include introductory text, meta-commentary, "
-        "explanations, multiple options, or conversational fluff. If the source text is short, vague, "
-        "or nonsensical, translate it literally without explaining yourself."
-    )
-    
-    prompt = f"""
-    Target Language: {data.target_language}
-    Tone Preference: {data.tone}
-    Original Description: {data.description}
-    """
-    try:
-        completion = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction, # <-- Keeps the response clean
-                temperature=0.2 # <-- Low temp stops it from getting "creative"
-            )
-        )
-        return {"rewritten_text": completion.text.strip()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 # FEATURE 5: AI Review Summary & Sentiment Analytics
 @app.post("/products/reviews/analyze")
 def analyze_reviews(data: ReviewsInput):
-    """
-    Compiles long list blocks of community feedback text into dynamic summaries.
-    """
+    """Compiles long list blocks of community feedback text into dynamic summaries."""
     client = get_gemini_client()
     prompt = f"""
     Read through these customer reviews left on our site product page:

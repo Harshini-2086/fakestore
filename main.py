@@ -49,7 +49,7 @@ class DBProduct(Base):
     category_image = Column(String)
     category_slug = Column(String)
     images = Column(JSON)  # Stores lists of image URLs safely
-    embedding = Column(Vector(768))  # Gemini dimensions
+    embedding = Column(Vector(3072))  # Gemini dimensions
 
 class DBCartItem(Base):
     __tablename__ = "cart_items"

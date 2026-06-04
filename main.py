@@ -1,38 +1,26 @@
 import os
-import json
+import sys
 import requests
-import numpy as np
 from contextlib import asynccontextmanager
+from fastapi import FastAPI, Depends, HTTPException
+from pydantic import BaseModel, Field
+from typing import List, Optional
 from google import genai
-from google.genai import types
-from fastapi import FastAPI, HTTPException, status, UploadFile, File, Depends
-from pydantic import BaseModel, HttpUrl
-from pydantic_settings import BaseSettings
-
-# --- DATABASE ENGINE INTEGRATIONS ---
 from sqlalchemy import create_engine, Column, Integer, String, Float, JSON, select, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from pgvector.sqlalchemy import Vector
 
+# ==========================================
+# 1. DATABASE & CLOUD CONFIGURATION
+# ==========================================
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("CRITICAL ERROR: DATABASE_URL environment variable is missing!")
 
-# Environment Configurations
-class Settings(BaseSettings):
-    # Fallback default value connects locally if no environmental variable overrides it
-    DATABASE_URL: str = "postgresql+psycopg2://postgres:password@localhost:5432/postgres"
-    GEMINI_API_KEY: str = ""
-
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
-
-settings = Settings()
-
-# Setup relational connection pools and core base declarations
-engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Request dependency helper to allocate distinct transaction workspaces safely
 def get_db():
     db = SessionLocal()
     try:
@@ -40,11 +28,19 @@ def get_db():
     finally:
         db.close()
 
-# --- Database Tabular Formats ---
+def get_gemini_client():
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("CRITICAL ERROR: GEMINI_API_KEY environment variable is missing!")
+    return genai.Client(api_key=api_key)
+
+# ==========================================
+# 2. DATA MODELS (PostgreSQL / SQLAlchemy)
+# ==========================================
 class DBProduct(Base):
     __tablename__ = "products"
-
-    id = Column(Integer, primary_key=True)
+    
+    id = Column(Integer, primary_key=True, index=True)
     title = Column(String, nullable=False)
     price = Column(Float, nullable=False)
     description = Column(String)
@@ -52,46 +48,81 @@ class DBProduct(Base):
     category_name = Column(String)
     category_image = Column(String)
     category_slug = Column(String)
-    images = Column(JSON)  
-    embedding = Column(Vector(768), nullable=True) # gemini-embedding-001 output shape
+    images = Column(JSON)  # Stores lists of image URLs safely
+    embedding = Column(Vector(768))  # Gemini dimensions
 
 class DBCartItem(Base):
     __tablename__ = "cart_items"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, default=1, index=True) 
+    
+    id = Column(Integer, primary_key=True, index=True)
     product_id = Column(Integer, nullable=False)
     quantity = Column(Integer, default=1)
 
-# --- Lifespan Event Initializer ---
+# ==========================================
+# 3. HELPER FUNCTIONS & FALLBACKS
+# ==========================================
+def fetch_catalog():
+    """Fallback function to fetch raw API items if DB is empty or unreachable."""
+    response = requests.get("https://fakestoreapi.com/products", timeout=10)
+    if response.status_code == 200:
+        raw_items = response.json()
+        # Format strings cleanly to match expected frontend structure
+        return [
+            {
+                "id": item["id"],
+                "title": item["title"],
+                "price": float(item["price"]),
+                "description": item["description"],
+                "category": {
+                    "id": item.get("id"),
+                    "name": item.get("category", "General"),
+                    "image": item.get("image", "https://placehold.co/600x400"),
+                    "slug": item.get("category", "general").lower().replace(" ", "-")
+                },
+                "images": [item.get("image")]
+            }
+            for item in raw_items
+        ]
+    return []
+
+def format_db_product(p: DBProduct):
+    """Maps custom flat SQL tables safely back into standardized nested objects."""
+    img_list = p.images if isinstance(p.images, list) else [p.images] if p.images else []
+    return {
+        "id": p.id,
+        "title": p.title,
+        "price": p.price,
+        "description": p.description,
+        "category": {
+            "id": p.category_id if p.category_id is not None else p.id,
+            "name": p.category_name if p.category_name else "General",
+            "image": p.category_image if p.category_image else "https://placehold.co/600x400",
+            "slug": p.category_slug if p.category_slug else "general"
+        },
+        "images": img_list
+    }
+
+# ==========================================
+# 4. LIFESPAN / BOOTUP SYNC MANAGEMENT
+# ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Executes atomic structural setups immediately upon app boot sequence."""
-    import sys
-    
-    # 1. Reach out to database engine and unlock vector extensions if not built
     with engine.connect() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
         conn.commit()
     
-    # 2. Automatically generate matching table structures if absent
     Base.metadata.create_all(bind=engine)
     
-    # 3. Synchronize initial item catalog from external source safely
     db = SessionLocal()
     try:
-        print("--> LOGSTAMP: Checking/Syncing catalog inventory with PostgreSQL database...", flush=True)
-        
-        # Check if we already have items saved to avoid hitting the external API needlessly
+        print("--> LOGSTAMP: Checking catalog inventory with PostgreSQL database...", flush=True)
         existing_count = db.query(DBProduct).count()
         print(f"--> LOGSTAMP: Current products in database: {existing_count}", flush=True)
         
         if existing_count == 0:
             print("--> LOGSTAMP: Database is empty. Attempting live catalog pull...", flush=True)
-            
-            # Using a highly stable alternative mirror endpoint for the fake store data
             response = requests.get("https://fakestoreapi.com/products", timeout=10)
-            print(f"--> LOGSTAMP: External Catalog HTTP Status Code: {response.status_code}", flush=True)
             
             if response.status_code == 200:
                 catalog_items = response.json()
@@ -110,16 +141,13 @@ async def lifespan(app: FastAPI):
                         print(f"--> LOGSTAMP: Embedding skipped for ID {p.get('id')}: {embed_err}", flush=True)
                         vector_data = None
 
-                    # Flexible mapping to safely handle data schema variations
-                    category_data = p.get('category', 'General')
-                    cat_name = category_data if isinstance(category_data, str) else p.get('category', {}).get('name', 'General')
-
+                    cat_name = p.get('category', 'General')
                     new_product = DBProduct(
                         id=p["id"],
                         title=p["title"],
                         price=float(p["price"]),
                         description=p["description"],
-                        category_id=p.get("category", {}).get("id", p["id"]) if isinstance(p.get("category"), dict) else p["id"],
+                        category_id=p.get("id"),
                         category_name=cat_name,
                         category_image=str(p.get("image", "https://placehold.co/600x400")),
                         category_slug=cat_name.lower().replace(" ", "-"),
@@ -129,311 +157,73 @@ async def lifespan(app: FastAPI):
                     db.add(new_product)
                 db.commit()
                 print("--> LOGSTAMP: Database inventory initialization successful!", flush=True)
-            else:
-                print("--> LOGSTAMP: Primary endpoint returned non-200. Seeding database with fallback static items...", flush=True)
-                # (Optional fallback mock data could be placed here if desired)
         else:
             print("--> LOGSTAMP: Local cache verification completed. Sync skipped.", flush=True)
-            
     except Exception as e:
         print(f"--> LOGSTAMP: Non-blocking catalog sync error at boot: {str(e)}", file=sys.stderr, flush=True)
     finally:
         db.close()
-        
     yield
 
-app = FastAPI(title="Fake Store AI Platform Wrapper", lifespan=lifespan)
+app = FastAPI(title="AI-Powered E-Commerce Store Platform", lifespan=lifespan)
 
-# --- Standard Core Pydantic Models ---
-class Category(BaseModel):
-    id: int
-    name: str
-    image: HttpUrl
-    slug: str
+# ==========================================
+# 5. API ROUTES
+# ==========================================
 
-class Product(BaseModel):
-    id: int
-    title: str
-    price: float
-    description: str
-    category: Category
-    images: list[HttpUrl]
-
-class CartInput(BaseModel):
-    product_id: int
-    quantity: int = 1
-
-class DynamicTranslateInput(BaseModel):
-    target_language: str = "Hindi"
-    tone: str = "Semi-Professional, friendly, and concise"
-
-class ReviewsInput(BaseModel):
-    reviews: list[str]
-
-# --- Structural Schemas for AI Responses ---
-class ReviewSummarySchema(BaseModel):
-    overall_sentiment: str  
-    pros: list[str]
-    cons: list[str]
-    verdict: str
-
-class ItemRecommendation(BaseModel):
-    cart_product_id: int
-    cart_product_title: str
-    recommended_product_ids: list[int]
-    pitch_to_user: str
-
-class MultiCartAnalysisSchema(BaseModel):
-    recommendations_by_item: list[ItemRecommendation]
-    global_reasoning: str
-
-# --- Helper Functions ---
-def get_gemini_client():
-    apikey = os.environ.get("GEMINI_API_KEY", settings.GEMINI_API_KEY).strip()
-    if not apikey:
-        raise HTTPException(
-            status_code=500, 
-            detail="GEMINI_API_KEY environment variable is missing."
-        )
-    return genai.Client(api_key=apikey, vertexai=False)
-
-def format_db_product(p: DBProduct):
-    """Maps custom flat SQL tables back into standardized nested objects."""
-    return {
-        "id": p.id,
-        "title": p.title,
-        "price": p.price,
-        "description": p.description,
-        "category": {
-            "id": p.category_id,
-            "name": p.category_name,
-            "image": p.category_image,
-            "slug": p.category_slug
-        },
-        "images": p.images
-    }
-
-# --- Standard Route Handlers ---
 @app.get("/")
-def read_root():
-    return {"message": "Welcome to the Fake Store AI API Wrapper! Go to /docs to test endpoints."}
+def home():
+    return {"status": "online", "message": "Welcome to the Production AI E-Commerce API"}
 
 @app.get("/products")
 def list_products(db: Session = Depends(get_db)):
-    products = db.query(DBProduct).all()
-    return [format_db_product(p) for p in products]
+    """Fetches store products cleanly with zero 500 crashes if DB state fails."""
+    try:
+        products = db.query(DBProduct).all()
+        if not products:
+            print("--> LOGSTAMP: Database empty. Running raw fallback...", flush=True)
+            return fetch_catalog()
+        return [format_db_product(p) for p in products]
+    except Exception as db_err:
+        print(f"--> LOGSTAMP: Database read failed ({db_err}). Falling back to live API...", flush=True)
+        return fetch_catalog()
 
-@app.post("/cart/add")
-def add_to_cart(item: CartInput, db: Session = Depends(get_db)):
-    product = db.query(DBProduct).filter(DBProduct.id == item.product_id).first()
-    if not product:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
-            detail=f"Product with ID {item.product_id} does not exist in local inventory tables."
-        )
+@app.get("/products/search/smart")
+def smart_search(query: str, db: Session = Depends(get_db)):
+    """AI Vector semantic search using native pgvector cosine distances."""
+    if not query:
+        raise HTTPException(status_code=400, detail="Search query string missing")
     
-    existing_cart_item = db.query(DBCartItem).filter(DBCartItem.product_id == item.product_id).first()
-    if existing_cart_item:
-        existing_cart_item.quantity += item.quantity
-    else:
-        db.add(DBCartItem(product_id=item.product_id, quantity=item.quantity))
+    try:
+        client = get_gemini_client()
+        embed_resp = client.models.embed_content(
+            model="gemini-embedding-001",
+            contents=query
+        )
+        query_vector = embed_resp.embeddings[0].values
         
-    db.commit()
-    return {"message": "Successfully added item to database cart"}
+        # Calculate cosine similarity using native SQL extensions (<=> distance metric)
+        stmt = select(DBProduct).order_by(DBProduct.embedding.cosine_distance(query_vector)).limit(5)
+        results = db.scalars(stmt).all()
+        
+        if not results:
+            return {"message": "No matching concepts found", "results": []}
+            
+        return [format_db_product(p) for p in results]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Semantic matching pipeline failed: {str(e)}")
 
 @app.get("/cart")
 def view_cart(db: Session = Depends(get_db)):
-    cart_items = db.query(DBCartItem).all()
-    output = [{"product_id": c.product_id, "quantity": c.quantity} for c in cart_items]
-    return {
-        "total_items_in_cart": len(output), 
-        "cart_items": output
-    }
+    return db.query(DBCartItem).all()
 
-# --- FEATURE 1: Combined Cart Analysis, Categorization & Inventory Matching ---
-@app.get("/cart/ai-analyze-and-match")
-def analyze_cart_and_match_inventory(db: Session = Depends(get_db)):
-    cart_items = db.query(DBCartItem).all()
-    if not cart_items:
-        raise HTTPException(status_code=400, detail="Your database cart is empty!")
-        
-    client = get_gemini_client()
-    cart_ids = [item.product_id for item in cart_items]
-    db_cart_products = db.query(DBProduct).filter(DBProduct.id.in_(cart_ids)).all()
-    
-    items_in_cart = [
-        {"id": p.id, "title": p.title, "description": p.description} 
-        for p in db_cart_products
-    ]
-    
-    db_catalog = db.query(DBProduct).filter(DBProduct.id.notin_(cart_ids)).limit(30).all()
-    available_catalog = [
-        {"id": p.id, "title": p.title, "category": p.category_name, "description": p.description}
-        for p in db_catalog
-    ]
-
-    prompt = f"""
-    You are an advanced e-commerce cross-selling and recommendation system.
-    The user has multiple items in their shopping cart:
-    {json.dumps(items_in_cart)}
-    
-    Look over our available store inventory:
-    {json.dumps(available_catalog)}
-    
-    For EACH individual item currently in the user's cart, look through the available store inventory and select 1 to 2 relevant, complementary, or similar products. 
-    Then, write a tailored 1-sentence pitch for that specific pairing.
-    """
-
-    try:
-        completion = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=MultiCartAnalysisSchema 
-            )
-        )
-        
-        ai_response = json.loads(completion.text)
-        item_recommendations = ai_response.get("recommendations_by_item", [])
-        
-        final_output = []
-        for rec in item_recommendations:
-            rec_ids = rec.get("recommended_product_ids", [])
-            matched_db_products = db.query(DBProduct).filter(DBProduct.id.in_(rec_ids)).all()
-            
-            final_output.append({
-                "cart_product_id": rec.get("cart_product_id"),
-                "cart_product_title": rec.get("cart_product_title"),
-                "pitch_to_user": rec.get("pitch_to_user"),
-                "similar_matched_products": [format_db_product(p) for p in matched_db_products]
-            })
-            
-        return {
-            "global_reasoning": ai_response.get("global_reasoning"),
-            "recommendations": final_output
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI Matching pipeline failed: {str(e)}")
-    
-# --- FEATURE 2: Smart Search via Native pgvector Database Operators ---
-@app.get("/products/search/smart")
-def smart_search(query: str, db: Session = Depends(get_db)):
-    """Executes a semantic vector search query natively inside the SQL database layer."""
-    client = get_gemini_client()
-    
-    query_embed_resp = client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=query
-    )
-    query_vector = query_embed_resp.embeddings[0].values
-    
-    # Executes clean cosine calculations directly inside PostgreSQL using the <=> operator
-    stmt = (
-        select(DBProduct)
-        .order_by(DBProduct.embedding.cosine_distance(query_vector))
-        .limit(15)
-    )
-    
-    results = db.scalars(stmt).all()
-    return {"results": [format_db_product(p) for p in results]}
-
-# --- FEATURE 3: Cart Context Localization & Translation ---
-@app.post("/cart/translate-descriptions")
-def translate_cart_descriptions(data: DynamicTranslateInput, db: Session = Depends(get_db)):
-    cart_items = db.query(DBCartItem).all()
-    if not cart_items:
-        raise HTTPException(status_code=400, detail="Shopping cart database table is empty.")
-        
-    client = get_gemini_client()
-    cart_ids = [item.product_id for item in cart_items]
-    db_products = db.query(DBProduct).filter(DBProduct.id.in_(cart_ids)).all()
-    
-    items_to_translate = [
-        {"id": p.id, "title": p.title, "description": p.description}
-        for p in db_products
-    ]
-    
-    system_instruction = (
-        "You are a strict e-commerce localization utility. Translate the provided list of items "
-        "including their descriptions and titles into the targeted configuration. "
-        "Return ONLY valid minified JSON that mirrors the input structure with rewritten texts. "
-        "Do not wrap your output in markdown blocks or include pre/post conversational text strings."
-    )
-    
-    prompt = f"""
-    Target Language: {data.target_language}
-    Tone Preference: {data.tone}
-    
-    Items Array to Transform:
-    {json.dumps(items_to_translate)}
-    """
-    
-    try:
-        completion = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.3,
-                response_mime_type="application/json"
-            )
-        )
-        return {"translated_cart_items": json.loads(completion.text.strip())}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Localization engine failure: {str(e)}")
-
-# --- FEATURE 4: Multimodal Visual Shopping Search ---
-@app.post("/products/search/visual")
-async def visual_search(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    client = get_gemini_client()
-    db_catalog = db.query(DBProduct).limit(30).all()
-    light_catalog = [{"id": p.id, "title": p.title, "category": p.category_name} for p in db_catalog]
-    image_bytes = await file.read()
-    
-    prompt = f"""
-    Analyze the uploaded item in this visual photo. Look over our catalog data:
-    {light_catalog}
-    
-    Find and return up to 3 Product IDs from the catalog list that look visually similar in color, shape, pattern, or utility.
-    Return your answer strictly as a comma-separated list of IDs, nothing else. Example: 4, 12, 18
-    """
-    
-    try:
-        completion = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[
-                types.Part.from_bytes(data=image_bytes, mime_type=file.content_type),
-                prompt
-            ]
-        )
-        
-        id_strings = completion.text.strip().split(",")
-        matched_ids = [int(i.strip()) for i in id_strings if i.strip().isdigit()]
-        
-        results = db.query(DBProduct).filter(DBProduct.id.in_(matched_ids)).all()
-        return {"matched_products": [format_db_product(p) for p in results]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# --- FEATURE 5: AI Review Summary & Sentiment Analytics ---
-@app.post("/products/reviews/analyze")
-def analyze_reviews(data: ReviewsInput):
-    client = get_gemini_client()
-    prompt = f"""
-    Read through these customer reviews left on our site product page:
-    {data.reviews}
-    Summarize the overall shared customer consensus. Extract core pros and cons.
-    """ 
-    try:
-        completion = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=ReviewSummarySchema
-            )
-        )
-        return json.loads(completion.text)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/cart/add")
+def add_to_cart(product_id: int, quantity: int = 1, db: Session = Depends(get_db)):
+    item = db.query(DBCartItem).filter(DBCartItem.product_id == product_id).first()
+    if item:
+        item.quantity += quantity
+    else:
+        item = DBCartItem(product_id=product_id, quantity=quantity)
+        db.add(item)
+    db.commit()
+    return {"message": "Cart persistence storage synced", "product_id": product_id}

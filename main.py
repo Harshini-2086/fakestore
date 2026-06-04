@@ -108,10 +108,14 @@ def format_db_product(p: DBProduct):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Executes atomic structural setups immediately upon app boot sequence."""
+    import time
+    
+    # 1. Ensure the Vector extension is enabled in Postgres
     with engine.connect() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
         conn.commit()
     
+    # 2. Automatically generate matching table structures if absent
     Base.metadata.create_all(bind=engine)
     
     db = SessionLocal()
@@ -127,20 +131,26 @@ async def lifespan(app: FastAPI):
             if response.status_code == 200:
                 catalog_items = response.json()
                 client = get_gemini_client()
-                print(f"--> LOGSTAMP: Found {len(catalog_items)} items. Calculating embeddings...", flush=True)
+                print(f"--> LOGSTAMP: Found {len(catalog_items)} items. Calculating embeddings with rate-limit pacing...", flush=True)
                 
-                for p in catalog_items:
+                for idx, p in enumerate(catalog_items):
                     text_chunk = f"{p.get('title', '')}: {p.get('description', '')}"
-                    try:
-                        embed_resp = client.models.embed_content(
-                            model="gemini-embedding-001",
-                            contents=text_chunk
-                        )
-                        vector_data = embed_resp.embeddings[0].values
-                    except Exception as embed_err:
-                        print(f"--> LOGSTAMP: Embedding skipped for ID {p.get('id')}: {embed_err}", flush=True)
-                        vector_data = None
-
+                    vector_data = None
+                    
+                    # Retry logic for Gemini API to avoid free-tier rate limits
+                    for attempt in range(3):
+                        try:
+                            embed_resp = client.models.embed_content(
+                                model="gemini-embedding-001",
+                                contents=text_chunk
+                            )
+                            vector_data = embed_resp.embeddings[0].values
+                            break  # Success! Break the retry loop
+                        except Exception as embed_err:
+                            print(f"--> LOGSTAMP: Gemini hit a hiccup on item {p.get('id')} (Attempt {attempt+1}/3): {embed_err}", flush=True)
+                            time.sleep(2)  # Cool down before retrying
+                    
+                    # Map the product data cleanly
                     cat_name = p.get('category', 'General')
                     new_product = DBProduct(
                         id=p["id"],
@@ -152,9 +162,13 @@ async def lifespan(app: FastAPI):
                         category_image=str(p.get("image", "https://placehold.co/600x400")),
                         category_slug=cat_name.lower().replace(" ", "-"),
                         images=[p.get("image")] if "image" in p else p.get("images", []),
-                        embedding=vector_data
+                        embedding=vector_data  # Will be saved as None if embeddings completely fail, preventing a crash!
                     )
                     db.add(new_product)
+                    
+                    # Small 300ms pause between items to stay well under free tier rate limits
+                    time.sleep(0.3)
+                
                 db.commit()
                 print("--> LOGSTAMP: Database inventory initialization successful!", flush=True)
         else:

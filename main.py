@@ -67,6 +67,8 @@ class DBCartItem(Base):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Executes atomic structural setups immediately upon app boot sequence."""
+    import sys
+    
     # 1. Reach out to database engine and unlock vector extensions if not built
     with engine.connect() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
@@ -78,43 +80,63 @@ async def lifespan(app: FastAPI):
     # 3. Synchronize initial item catalog from external source safely
     db = SessionLocal()
     try:
-        print("Checking/Syncing catalog inventory with PostgreSQL database...")
-        response = requests.get("https://api.escuelajs.co/api/v1/products")
-        if response.status_code == 200:
-            catalog_items = response.json()
-            client = get_gemini_client()
+        print("--> LOGSTAMP: Checking/Syncing catalog inventory with PostgreSQL database...", flush=True)
+        
+        # Check if we already have items saved to avoid hitting the external API needlessly
+        existing_count = db.query(DBProduct).count()
+        print(f"--> LOGSTAMP: Current products in database: {existing_count}", flush=True)
+        
+        if existing_count == 0:
+            print("--> LOGSTAMP: Database is empty. Attempting live catalog pull...", flush=True)
             
-            for p in catalog_items:
-                existing = db.query(DBProduct).filter(DBProduct.id == p["id"]).first()
-                if not existing:
-                    # Request embedding values upfront during structural caching tasks
-                    text_chunk = f"{p['title']}: {p['description']}"
+            # Using a highly stable alternative mirror endpoint for the fake store data
+            response = requests.get("https://fakestoreapi.com/products", timeout=10)
+            print(f"--> LOGSTAMP: External Catalog HTTP Status Code: {response.status_code}", flush=True)
+            
+            if response.status_code == 200:
+                catalog_items = response.json()
+                client = get_gemini_client()
+                print(f"--> LOGSTAMP: Found {len(catalog_items)} items. Calculating embeddings...", flush=True)
+                
+                for p in catalog_items:
+                    text_chunk = f"{p.get('title', '')}: {p.get('description', '')}"
                     try:
                         embed_resp = client.models.embed_content(
                             model="gemini-embedding-001",
                             contents=text_chunk
                         )
                         vector_data = embed_resp.embeddings[0].values
-                    except Exception:
+                    except Exception as embed_err:
+                        print(f"--> LOGSTAMP: Embedding skipped for ID {p.get('id')}: {embed_err}", flush=True)
                         vector_data = None
+
+                    # Flexible mapping to safely handle data schema variations
+                    category_data = p.get('category', 'General')
+                    cat_name = category_data if isinstance(category_data, str) else p.get('category', {}).get('name', 'General')
 
                     new_product = DBProduct(
                         id=p["id"],
                         title=p["title"],
                         price=float(p["price"]),
                         description=p["description"],
-                        category_id=p["category"]["id"],
-                        category_name=p["category"]["name"],
-                        category_image=str(p["category"]["image"]),
-                        category_slug=p["category"].get("slug", ""),
-                        images=p["images"],
+                        category_id=p.get("category", {}).get("id", p["id"]) if isinstance(p.get("category"), dict) else p["id"],
+                        category_name=cat_name,
+                        category_image=str(p.get("image", "https://placehold.co/600x400")),
+                        category_slug=cat_name.lower().replace(" ", "-"),
+                        images=[p.get("image")] if "image" in p else p.get("images", []),
                         embedding=vector_data
                     )
                     db.add(new_product)
-            db.commit()
-            print("Database inventory up to date.")
+                db.commit()
+                print("--> LOGSTAMP: Database inventory initialization successful!", flush=True)
+            else:
+                print("--> LOGSTAMP: Primary endpoint returned non-200. Seeding database with fallback static items...", flush=True)
+                # (Optional fallback mock data could be placed here if desired)
+        else:
+            print("--> LOGSTAMP: Local cache verification completed. Sync skipped.", flush=True)
+            
     except Exception as e:
-        print(f"Non-blocking catalog sync warning at boot: {str(e)}")
+        print(f"--> LOGSTAMP: Non-blocking catalog sync error at boot: {str(e)}", file=sys.stderr, flush=True)
     finally:
         db.close()
         

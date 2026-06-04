@@ -9,3 +9,6 @@ numpy
 python-multipart
 firebase-admin
 gunicorn
+sqlalchemy
+pgvector
+psycopg2-binary

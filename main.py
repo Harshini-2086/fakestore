@@ -17,7 +17,7 @@ from pgvector.sqlalchemy import Vector
 # Environment Configurations
 class Settings(BaseSettings):
     # Fallback default value connects locally if no environmental variable overrides it
-    DATABASE_URL: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
+    DATABASE_URL: str = "postgresql+psycopg2://postgres:@postgres@localhost:5432/postgres"
     GEMINI_API_KEY: str = ""
 
     class Config:
